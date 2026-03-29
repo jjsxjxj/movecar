@@ -2,40 +2,84 @@ addEventListener('fetch', event => {
   event.respondWith(handleRequest(event.request))
 })
 
-const CONFIG = { KV_TTL: 3600 }
+const CONFIG = { 
+  KV_TTL: 3600,
+  RATE_LIMIT_SECONDS: 60, // 1分钟频率限制
+  DELAY_SECONDS: 30       // 无位置延迟30秒
+}
+
+// 车牌配置 - 每个二维码绑定一个车牌
+// 格式: 二维码ID -> 车牌号
+const PLATE_BINDINGS = {
+  'default': '京A12345',  // 默认车牌，建议修改为实际车牌
+  // 示例: 'abc123': '京B88888',
+  // 示例: 'xyz789': '沪C66666',
+}
 
 async function handleRequest(request) {
   const url = new URL(request.url)
   const path = url.pathname
+  const plateId = url.searchParams.get('plate') || 'default'
+  // 优先使用环境变量中的车牌配置
+  const boundPlate = typeof self.PLATE_BINDINGS !== 'undefined' ? self.PLATE_BINDINGS : (PLATE_BINDINGS[plateId] || PLATE_BINDINGS['default'])
+
+  // API 路由
+  if (path === '/api/verify-plate' && request.method === 'POST') {
+    return handleVerifyPlate(request, boundPlate)
+  }
 
   if (path === '/api/notify' && request.method === 'POST') {
-    return handleNotify(request, url);
-  }
-
-  if (path === '/api/get-location') {
-    return handleGetLocation();
-  }
-
-  if (path === '/api/owner-confirm' && request.method === 'POST') {
-    return handleOwnerConfirmAction(request);
+    return handleNotify(request, url, plateId)
   }
 
   if (path === '/api/check-status') {
-    const status = await MOVE_CAR_STATUS.get('notify_status');
-    const ownerLocation = await MOVE_CAR_STATUS.get('owner_location');
-    return new Response(JSON.stringify({
-      status: status || 'waiting',
-      ownerLocation: ownerLocation ? JSON.parse(ownerLocation) : null
+    return handleCheckStatus(request, plateId)
+  }
+
+  if (path === '/api/get-location') {
+    return handleGetLocation(plateId)
+  }
+
+  if (path === '/api/owner-confirm' && request.method === 'POST') {
+    return handleOwnerConfirmAction(request, plateId)
+  }
+
+  // 页面路由
+  if (path === '/owner-confirm') {
+    return renderOwnerPage(boundPlate)
+  }
+
+  // 主页面 - 带车牌参数
+  return renderMainPage(url.origin, boundPlate, plateId)
+}
+
+// 处理车牌验证
+async function handleVerifyPlate(request, boundPlate) {
+  try {
+    const body = await request.json()
+    const inputPlate = body.plate || ''
+    
+    // 标准化车牌（去除空格，转大写）
+    const normalizedInput = inputPlate.replace(/\s/g, '').toUpperCase()
+    const normalizedBound = boundPlate.replace(/\s/g, '').toUpperCase()
+    
+    const isValid = normalizedInput === normalizedBound
+    
+    return new Response(JSON.stringify({ 
+      success: isValid,
+      message: isValid ? '验证通过' : '车牌号不匹配，请确认后重试'
     }), {
       headers: { 'Content-Type': 'application/json' }
-    });
+    })
+  } catch (error) {
+    return new Response(JSON.stringify({ 
+      success: false, 
+      message: '验证失败，请重试'
+    }), { 
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    })
   }
-
-  if (path === '/owner-confirm') {
-    return renderOwnerPage();
-  }
-
-  return renderMainPage(url.origin);
 }
 
 // WGS-84 转 GCJ-02 (中国国测局坐标系)
@@ -72,7 +116,7 @@ function transformLng(x, y) {
   let ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x));
   ret += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0;
   ret += (20.0 * Math.sin(x * Math.PI) + 40.0 * Math.sin(x / 3.0 * Math.PI)) * 2.0 / 3.0;
-  ret += (150.0 * Math.sin(x / 12.0 * Math.PI) + 300.0 * Math.sin(x / 30.0 * Math.PI)) * 2.0 / 3.0;
+  ret += (150.0 * Math.sin(x / 12.0 * Math.PI) + 300 * Math.sin(x / 30.0 * Math.PI)) * 2.0 / 3.0;
   return ret;
 }
 
@@ -84,88 +128,195 @@ function generateMapUrls(lat, lng) {
   };
 }
 
-async function handleNotify(request, url) {
+// 获取请求者IP/标识
+function getRequesterId(request) {
+  return request.headers.get('CF-Connecting-IP') || 'unknown'
+}
+
+// 检查频率限制
+async function checkRateLimit(requesterId, plateId) {
+  const key = `rate_limit:${plateId}:${requesterId}`
+  const lastRequest = await MOVE_CAR_STATUS.get(key)
+  
+  if (lastRequest) {
+    const lastTime = parseInt(lastRequest)
+    const now = Date.now()
+    const elapsed = Math.floor((now - lastTime) / 1000)
+    
+    if (elapsed < CONFIG.RATE_LIMIT_SECONDS) {
+      const remaining = CONFIG.RATE_LIMIT_SECONDS - elapsed
+      return { allowed: false, remaining }
+    }
+  }
+  
+  return { allowed: true, remaining: 0 }
+}
+
+// 更新频率限制
+async function updateRateLimit(requesterId, plateId) {
+  const key = `rate_limit:${plateId}:${requesterId}`
+  await MOVE_CAR_STATUS.put(key, Date.now().toString(), { expirationTtl: CONFIG.RATE_LIMIT_SECONDS * 2 })
+}
+
+// 检查请求是否已关闭
+async function isRequestClosed(plateId) {
+  const status = await MOVE_CAR_STATUS.get(`status:${plateId}`)
+  return status === 'closed'
+}
+
+// 关闭请求链路
+async function closeRequest(plateId) {
+  await MOVE_CAR_STATUS.put(`status:${plateId}`, 'closed', { expirationTtl: 600 })
+}
+
+async function handleNotify(request, url, plateId) {
   try {
-    const body = await request.json();
-    const message = body.message || '车旁有人等待';
-    const location = body.location || null;
-    const delayed = body.delayed || false;
+    const requesterId = getRequesterId(request)
+    
+    // 检查请求是否已关闭
+    const closed = await isRequestClosed(plateId)
+    if (closed) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '该请求已处理完毕，无法再次发送通知',
+        closed: true
+      }), { 
+        status: 403,
+        headers: { 'Content-Type': 'application/json' }
+      })
+    }
+    
+    // 检查频率限制
+    const rateCheck = await checkRateLimit(requesterId, plateId)
+    if (!rateCheck.allowed) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '发送太频繁，请稍后再试',
+        retryAfter: rateCheck.remaining
+      }), { 
+        status: 429,
+        headers: { 'Content-Type': 'application/json' }
+      })
+    }
+    
+    const body = await request.json()
+    const message = body.message || '车旁有人等待'
+    const location = body.location || null
+    const delayed = body.delayed || false
+    const boundPlate = body.boundPlate || ''
 
-    const confirmUrl = encodeURIComponent(url.origin + '/owner-confirm');
+    const confirmUrl = encodeURIComponent(url.origin + '/owner-confirm?plate=' + plateId)
 
-    let notifyBody = '🚗 挪车请求';
-    if (message) notifyBody += `\\n💬 留言: ${message}`;
+    let notifyBody = `🚗 挪车请求\n🚙 车牌: ${boundPlate}`
+    if (message) notifyBody += `\n💬 留言: ${message}`
 
     if (location && location.lat && location.lng) {
-      const urls = generateMapUrls(location.lat, location.lng);
-      notifyBody += '\\n📍 已附带位置信息，点击查看';
+      const urls = generateMapUrls(location.lat, location.lng)
+      notifyBody += '\n📍 已附带位置信息，点击查看'
 
-      await MOVE_CAR_STATUS.put('requester_location', JSON.stringify({
+      await MOVE_CAR_STATUS.put(`requester_location:${plateId}`, JSON.stringify({
         lat: location.lat,
         lng: location.lng,
         ...urls
-      }), { expirationTtl: CONFIG.KV_TTL });
+      }), { expirationTtl: CONFIG.KV_TTL })
     } else {
-      notifyBody += '\\n⚠️ 未提供位置信息';
+      notifyBody += '\n⚠️ 未提供位置信息'
     }
 
-    await MOVE_CAR_STATUS.put('notify_status', 'waiting', { expirationTtl: 600 });
+    await MOVE_CAR_STATUS.put(`notify_status:${plateId}`, 'waiting', { expirationTtl: 600 })
+    
+    // 更新频率限制
+    await updateRateLimit(requesterId, plateId)
 
     // 如果是延迟发送，等待30秒
     if (delayed) {
-      await new Promise(resolve => setTimeout(resolve, 30000));
+      await new Promise(resolve => setTimeout(resolve, CONFIG.DELAY_SECONDS * 1000))
     }
 
-    const barkApiUrl = `${BARK_URL}/挪车请求/${encodeURIComponent(notifyBody)}?group=MoveCar&level=critical&call=1&sound=minuet&icon=https://cdn-icons-png.flaticon.com/512/741/741407.png&url=${confirmUrl}`;
+    const barkApiUrl = `${BARK_URL}/挪车请求/${encodeURIComponent(notifyBody)}?group=MoveCar&level=critical&call=1&sound=minuet&icon=https://cdn-icons-png.flaticon.com/512/741/741407.png&url=${confirmUrl}`
 
-    const barkResponse = await fetch(barkApiUrl);
-    if (!barkResponse.ok) throw new Error('Bark API Error');
+    const barkResponse = await fetch(barkApiUrl)
+    if (!barkResponse.ok) throw new Error('Bark API Error')
 
-    return new Response(JSON.stringify({ success: true }), {
+    return new Response(JSON.stringify({ 
+      success: true,
+      delayed: delayed,
+      nextAvailableIn: CONFIG.RATE_LIMIT_SECONDS
+    }), {
       headers: { 'Content-Type': 'application/json' }
-    });
+    })
   } catch (error) {
-    return new Response(JSON.stringify({ success: false, error: error.message }), { status: 500 });
+    return new Response(JSON.stringify({ success: false, error: error.message }), { 
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    })
   }
 }
 
-async function handleGetLocation() {
-  const data = await MOVE_CAR_STATUS.get('requester_location');
+async function handleCheckStatus(request, plateId) {
+  const status = await MOVE_CAR_STATUS.get(`notify_status:${plateId}`)
+  const ownerLocation = await MOVE_CAR_STATUS.get(`owner_location:${plateId}`)
+  const isClosed = await isRequestClosed(plateId)
+  
+  return new Response(JSON.stringify({
+    status: status || 'waiting',
+    ownerLocation: ownerLocation ? JSON.parse(ownerLocation) : null,
+    closed: isClosed
+  }), {
+    headers: { 'Content-Type': 'application/json' }
+  })
+}
+
+async function handleGetLocation(plateId) {
+  const data = await MOVE_CAR_STATUS.get(`requester_location:${plateId}`)
   if (data) {
-    return new Response(data, { headers: { 'Content-Type': 'application/json' } });
+    return new Response(data, { headers: { 'Content-Type': 'application/json' } })
   }
-  return new Response(JSON.stringify({ error: 'No location' }), { status: 404 });
+  return new Response(JSON.stringify({ error: 'No location' }), { status: 404 })
 }
 
-async function handleOwnerConfirmAction(request) {
+async function handleOwnerConfirmAction(request, plateId) {
   try {
-    const body = await request.json();
-    const ownerLocation = body.location || null;
+    const body = await request.json()
+    const ownerLocation = body.location || null
+    const ownerReply = body.reply || null
 
     if (ownerLocation) {
-      const urls = generateMapUrls(ownerLocation.lat, ownerLocation.lng);
-      await MOVE_CAR_STATUS.put('owner_location', JSON.stringify({
+      const urls = generateMapUrls(ownerLocation.lat, ownerLocation.lng)
+      await MOVE_CAR_STATUS.put(`owner_location:${plateId}`, JSON.stringify({
         lat: ownerLocation.lat,
         lng: ownerLocation.lng,
         ...urls,
+        reply: ownerReply,
         timestamp: Date.now()
-      }), { expirationTtl: CONFIG.KV_TTL });
+      }), { expirationTtl: CONFIG.KV_TTL })
+    } else if (ownerReply) {
+      // 如果没有位置但有回复，也存储回复
+      await MOVE_CAR_STATUS.put(`owner_location:${plateId}`, JSON.stringify({
+        reply: ownerReply,
+        timestamp: Date.now()
+      }), { expirationTtl: CONFIG.KV_TTL })
     }
 
-    await MOVE_CAR_STATUS.put('notify_status', 'confirmed', { expirationTtl: 600 });
-    return new Response(JSON.stringify({ success: true }), {
+    await MOVE_CAR_STATUS.put(`notify_status:${plateId}`, 'confirmed', { expirationTtl: 600 })
+    
+    // 关闭请求链路 - 确认后该请求者无法再次发送
+    await closeRequest(plateId)
+    
+    return new Response(JSON.stringify({ success: true, closed: true }), {
       headers: { 'Content-Type': 'application/json' }
-    });
+    })
   } catch (error) {
-    await MOVE_CAR_STATUS.put('notify_status', 'confirmed', { expirationTtl: 600 });
-    return new Response(JSON.stringify({ success: true }), {
+    await MOVE_CAR_STATUS.put(`notify_status:${plateId}`, 'confirmed', { expirationTtl: 600 })
+    await closeRequest(plateId)
+    return new Response(JSON.stringify({ success: true, closed: true }), {
       headers: { 'Content-Type': 'application/json' }
-    });
+    })
   }
 }
 
-function renderMainPage(origin) {
-  const phone = typeof PHONE_NUMBER !== 'undefined' ? PHONE_NUMBER : '';
+function renderMainPage(origin, boundPlate, plateId) {
+  const phone = typeof PHONE_NUMBER !== 'undefined' ? PHONE_NUMBER : ''
 
   const html = `
   <!DOCTYPE html>
@@ -175,24 +326,46 @@ function renderMainPage(origin) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="theme-color" content="#0093E9">
+    <meta name="theme-color" content="#ff6b9d">
     <title>通知车主挪车</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin>
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+    <noscript>
+      <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+    </noscript>
     <style>
       :root {
         --sat: env(safe-area-inset-top, 0px);
         --sar: env(safe-area-inset-right, 0px);
         --sab: env(safe-area-inset-bottom, 0px);
         --sal: env(safe-area-inset-left, 0px);
+        --primary: #ff6b9d;
+        --secondary: #feca57;
+        --accent: #54a0ff;
+        --light: #f8f9fa;
+        --dark: #2d3436;
+        --pink: #ff9ff3;
+        --purple: #5f27cd;
       }
-      * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; margin: 0; padding: 0; }
+      * {
+        box-sizing: border-box;
+        -webkit-tap-highlight-color: transparent;
+        margin: 0;
+        padding: 0;
+      }
       html {
         font-size: 16px;
         -webkit-text-size-adjust: 100%;
       }
-      html, body { height: 100%; }
+      html, body {
+        height: 100%;
+      }
       body {
-        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
-        background: linear-gradient(160deg, #0093E9 0%, #80D0C7 100%);
+        font-family: 'Noto Sans SC', -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
+        background: linear-gradient(135deg, #ff6b9d 0%, #feca57 25%, #48dbfb 50%, #1dd1a1 75%, #5f27cd 100%);
+        background-size: 400% 400%;
+        animation: gradientBG 15s ease infinite;
         min-height: 100vh;
         min-height: -webkit-fill-available;
         padding: clamp(16px, 4vw, 24px);
@@ -202,11 +375,88 @@ function renderMainPage(origin) {
         padding-right: calc(clamp(16px, 4vw, 24px) + var(--sar));
         display: flex;
         justify-content: center;
-        align-items: flex-start;
+        align-items: center;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        text-rendering: optimizeLegibility;
+        position: relative;
+        backface-visibility: hidden;
+        transform: translateZ(0);
+      }
+      @keyframes gradientBG {
+        0% { background-position: 0% 50%; }
+        50% { background-position: 100% 50%; }
+        100% { background-position: 0% 50%; }
+      }
+      .loading-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(255, 255, 255, 0.9);
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        z-index: 9999;
+        backface-visibility: hidden;
+        transform: translateZ(0);
+      }
+      .loading-content {
+        text-align: center;
+        padding: 24px;
+        background: rgba(255, 255, 255, 0.95);
+        border-radius: 16px;
+        box-shadow: 0 10px 40px rgba(255, 107, 157, 0.3);
+        backface-visibility: hidden;
+        transform: translateZ(0);
+        border: 2px solid #ffd1dc;
+      }
+      .loading-spinner {
+        width: 48px;
+        height: 48px;
+        margin: 0 auto 16px;
+        border: 4px solid #ffd1dc;
+        border-top: 4px solid #ff6b9d;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+      }
+      @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+      }
+      .loading-content p {
+        color: #ff6b9d;
+        font-weight: 600;
+        margin: 0;
+      }
+      @media (max-height: 600px) {
+        body {
+          align-items: flex-start;
+          padding-top: calc(clamp(12px, 3vw, 20px) + var(--sat));
+        }
       }
       body::before {
         content: ''; position: fixed; inset: 0;
-        background: url("data:image/svg+xml,%3Csvg width='52' height='26' viewBox='0 0 52 26' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.1'%3E%3Cpath d='M10 10c0-2.21-1.79-4-4-4-3.314 0-6-2.686-6-6h2c0 2.21 1.79 4 4 4 3.314 0 6 2.686 6 6 0 2.21 1.79 4 4 4 3.314 0 6 2.686 6 6 0 2.21 1.79 4 4 4v2c-3.314 0-6-2.686-6-6 0-2.21-1.79-4-4-4-3.314 0-6-2.686-6-6zm25.464-1.95l8.486 8.486-1.414 1.414-8.486-8.486 1.414-1.414z' /%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+        background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.15'%3E%3Ccircle cx='30' cy='30' r='2'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+        z-index: -1;
+      }
+      body::after {
+        content: '✨';
+        position: fixed;
+        top: 20%;
+        left: 10%;
+        font-size: 24px;
+        animation: float 6s ease-in-out infinite;
+        z-index: -1;
+      }
+      body::before {
+        content: '🌸';
+        position: fixed;
+        bottom: 20%;
+        right: 10%;
+        font-size: 32px;
+        animation: float 8s ease-in-out infinite reverse;
         z-index: -1;
       }
 
@@ -215,47 +465,154 @@ function renderMainPage(origin) {
         max-width: 500px;
         display: flex;
         flex-direction: column;
-        gap: clamp(12px, 3vw, 20px);
+        gap: clamp(10px, 2.5vw, 16px);
       }
 
       .card {
         background: rgba(255, 255, 255, 0.95);
         border-radius: clamp(20px, 5vw, 28px);
         padding: clamp(18px, 4vw, 28px);
-        box-shadow: 0 10px 40px rgba(0, 147, 233, 0.2);
-        transition: transform 0.2s ease;
+        box-shadow: 0 10px 40px rgba(255, 107, 157, 0.2);
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
+        border: 2px solid transparent;
+        background-clip: padding-box;
+        position: relative;
+      }
+      .card::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        border-radius: clamp(18px, 4.5vw, 26px);
+        padding: 2px;
+        background: linear-gradient(135deg, #ff6b9d, #feca57, #48dbfb, #1dd1a1, #5f27cd);
+        -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+        -webkit-mask-composite: xor;
+        mask-composite: exclude;
+        z-index: -1;
       }
       @media (hover: hover) {
-        .card:hover { transform: translateY(-2px); }
+        .card:hover { 
+          transform: translateY(-2px); 
+          box-shadow: 0 12px 48px rgba(255, 107, 157, 0.3);
+        }
       }
       .card:active { transform: scale(0.98); }
 
       .header {
         text-align: center;
         padding: clamp(20px, 5vw, 32px) clamp(16px, 4vw, 28px);
-        background: white;
+        background: linear-gradient(135deg, #ffffff 0%, #fff0f5 100%);
+        border: 2px solid #ffb6c1;
       }
       .icon-wrap {
         width: clamp(72px, 18vw, 100px);
         height: clamp(72px, 18vw, 100px);
-        background: linear-gradient(135deg, #0093E9 0%, #80D0C7 100%);
-        border-radius: clamp(22px, 5vw, 32px);
+        background: linear-gradient(135deg, #ff6b9d 0%, #feca57 100%);
+        border-radius: 50%;
         display: flex; align-items: center; justify-content: center;
         margin: 0 auto clamp(14px, 3vw, 24px);
-        box-shadow: 0 12px 32px rgba(0, 147, 233, 0.35);
+        box-shadow: 0 12px 32px rgba(255, 107, 157, 0.35);
+        animation: pulse 2s ease-in-out infinite;
       }
       .icon-wrap span { font-size: clamp(36px, 9vw, 52px); }
       .header h1 {
         font-size: clamp(22px, 5.5vw, 30px);
         font-weight: 700;
-        color: #1a202c;
+        color: #ff6b9d;
         margin-bottom: 6px;
+        text-shadow: 1px 1px 2px rgba(255, 107, 157, 0.3);
       }
       .header p {
         font-size: clamp(13px, 3.5vw, 16px);
-        color: #718096;
+        color: #ff8fab;
         font-weight: 500;
       }
+
+      .plate-verify-card { text-align: center; }
+      .plate-verify-card h2 {
+        font-size: clamp(18px, 4.5vw, 22px);
+        color: #ff6b9d;
+        margin-bottom: 8px;
+        text-shadow: 1px 1px 2px rgba(255, 107, 157, 0.2);
+      }
+      .plate-verify-card p {
+        font-size: clamp(13px, 3.5vw, 15px);
+        color: #ff8fab;
+        margin-bottom: 20px;
+      }
+      .plate-input {
+        width: 100%;
+        padding: clamp(16px, 4vw, 20px);
+        font-size: clamp(18px, 4.5vw, 24px);
+        text-align: center;
+        border: 2px solid #ffb6c1;
+        border-radius: clamp(12px, 3vw, 16px);
+        margin-bottom: 16px;
+        font-weight: 600;
+        letter-spacing: 2px;
+        text-transform: uppercase;
+        background: #fff5f8;
+      }
+      .plate-input:focus { 
+        outline: none; 
+        border-color: #ff6b9d;
+        box-shadow: 0 0 0 3px rgba(255, 107, 157, 0.1);
+      }
+      .plate-input.error { 
+        border-color: #ff6b9d; 
+        background: #fff0f5;
+      }
+      .verify-btn {
+        width: 100%;
+        background: linear-gradient(135deg, #ff6b9d 0%, #feca57 25%, #48dbfb 50%, #1dd1a1 75%, #5f27cd 100%);
+        background-size: 400% 400%;
+        animation: gradientBG 3s ease infinite;
+        color: white;
+        border: 2px solid transparent;
+        padding: clamp(16px, 4vw, 20px);
+        border-radius: clamp(12px, 3vw, 16px);
+        font-size: clamp(16px, 4vw, 18px);
+        font-weight: 700;
+        cursor: pointer;
+        transition: all 0.2s;
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+        user-select: none;
+        box-shadow: 0 8px 24px rgba(255, 107, 157, 0.3);
+        position: relative;
+        background-clip: padding-box;
+      }
+      .verify-btn::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        border-radius: clamp(10px, 2.5vw, 14px);
+        padding: 2px;
+        background: linear-gradient(135deg, #ff6b9d, #feca57, #48dbfb, #1dd1a1, #5f27cd);
+        -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+        -webkit-mask-composite: xor;
+        mask-composite: exclude;
+        z-index: -1;
+      }
+      .verify-btn:active { transform: scale(0.96); transition: transform 0.1s ease; }
+      .verify-btn:disabled {
+        background: linear-gradient(135deg, #ffcdd2 0%, #ffb3ba 100%);
+        cursor: not-allowed;
+        box-shadow: none;
+      }
+      .error-msg {
+        color: #ff6b9d;
+        font-size: clamp(13px, 3.5vw, 14px);
+        margin-top: 12px;
+        display: none;
+      }
+      .error-msg.show { display: block; }
 
       .input-card { padding: 0; overflow: hidden; }
       .input-card textarea {
@@ -267,11 +624,11 @@ function renderMainPage(origin) {
         font-family: inherit;
         resize: none;
         outline: none;
-        color: #2d3748;
-        background: transparent;
+        color: #ff6b9d;
+        background: #fff5f8;
         line-height: 1.5;
       }
-      .input-card textarea::placeholder { color: #a0aec0; }
+      .input-card textarea::placeholder { color: #ffb6c1; }
       .tags {
         display: flex;
         gap: clamp(6px, 2vw, 10px);
@@ -282,8 +639,8 @@ function renderMainPage(origin) {
       }
       .tags::-webkit-scrollbar { display: none; }
       .tag {
-        background: linear-gradient(135deg, #e0f7fa 0%, #b2ebf2 100%);
-        color: #00796b;
+        background: linear-gradient(135deg, #ffd1dc 0%, #ffb6c1 100%);
+        color: #ff6b9d;
         padding: clamp(8px, 2vw, 12px) clamp(12px, 3vw, 18px);
         border-radius: 20px;
         font-size: clamp(13px, 3.5vw, 15px);
@@ -291,12 +648,17 @@ function renderMainPage(origin) {
         white-space: nowrap;
         cursor: pointer;
         transition: all 0.2s;
-        border: 1px solid #80cbc4;
+        border: 1px solid #ff9aa2;
         min-height: 44px;
         display: flex;
         align-items: center;
+        box-shadow: 0 4px 12px rgba(255, 107, 157, 0.15);
       }
-      .tag:active { transform: scale(0.95); background: #80cbc4; }
+      .tag:active { 
+        transform: scale(0.95); 
+        background: #ffb6c1;
+        box-shadow: 0 2px 8px rgba(255, 107, 157, 0.2);
+      }
 
       .loc-card {
         display: flex;
@@ -305,47 +667,51 @@ function renderMainPage(origin) {
         padding: clamp(14px, 3.5vw, 22px) clamp(16px, 4vw, 24px);
         cursor: pointer;
         min-height: 64px;
+        background: #fff5f8;
+        border: 2px solid #ffd1dc;
       }
       .loc-icon {
         width: clamp(44px, 11vw, 56px);
         height: clamp(44px, 11vw, 56px);
-        border-radius: clamp(14px, 3.5vw, 18px);
+        border-radius: 50%;
         display: flex; align-items: center; justify-content: center;
         font-size: clamp(22px, 5.5vw, 28px);
         transition: all 0.3s;
         flex-shrink: 0;
+        box-shadow: 0 4px 12px rgba(255, 107, 157, 0.2);
       }
-      .loc-icon.loading { background: #fff3cd; }
-      .loc-icon.success { background: #d4edda; }
-      .loc-icon.error { background: #f8d7da; }
+      .loc-icon.loading { 
+        background: linear-gradient(135deg, #feca57 0%, #ff6b9d 100%); 
+        animation: pulse 1.5s ease-in-out infinite;
+      }
+      .loc-icon.success { 
+        background: linear-gradient(135deg, #54a0ff 0%, #ff6b9d 100%); 
+      }
+      .loc-icon.error { 
+        background: linear-gradient(135deg, #ff6b9d 0%, #feca57 100%); 
+      }
       .loc-content { flex: 1; min-width: 0; }
       .loc-title {
         font-size: clamp(15px, 4vw, 18px);
         font-weight: 600;
-        color: #2d3748;
+        color: #ff6b9d;
       }
       .loc-status {
         font-size: clamp(12px, 3.2vw, 14px);
-        color: #718096;
+        color: #ff8fab;
         margin-top: 3px;
       }
-      .loc-status.success { color: #28a745; }
-      .loc-status.error { color: #dc3545; }
-      .loc-retry-btn {
-        color: #0093E9;
-        text-decoration: underline;
-        cursor: pointer;
-        margin-left: 8px;
-        font-weight: 600;
+      .loc-status.success { 
+        color: #54a0ff;
+        font-weight: 500;
       }
-      .loc-refresh {
-        font-size: clamp(20px, 5vw, 26px);
-        color: #a0aec0;
-        flex-shrink: 0;
+      .loc-status.error { 
+        color: #ff6b9d;
+        font-weight: 500;
       }
 
       .btn-main {
-        background: linear-gradient(135deg, #0093E9 0%, #80D0C7 100%);
+        background: linear-gradient(135deg, #ff6b9d 0%, #feca57 100%);
         color: white;
         border: none;
         padding: clamp(16px, 4vw, 22px);
@@ -354,13 +720,17 @@ function renderMainPage(origin) {
         font-weight: 700;
         cursor: pointer;
         display: flex; align-items: center; justify-content: center; gap: 10px;
-        box-shadow: 0 10px 30px rgba(0, 147, 233, 0.35);
+        box-shadow: 0 10px 30px rgba(255, 107, 157, 0.35);
         transition: all 0.2s;
         min-height: 56px;
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+        user-select: none;
+        border: 2px solid #ffd1dc;
       }
-      .btn-main:active { transform: scale(0.98); }
+      .btn-main:active { transform: scale(0.96); transition: transform 0.1s ease; }
       .btn-main:disabled {
-        background: linear-gradient(135deg, #94a3b8 0%, #64748b 100%);
+        background: linear-gradient(135deg, #ffcdd2 0%, #ffb3ba 100%);
         box-shadow: none;
         cursor: not-allowed;
       }
@@ -370,54 +740,66 @@ function renderMainPage(origin) {
         top: calc(20px + var(--sat));
         left: 50%;
         transform: translateX(-50%) translateY(-100px);
-        background: white;
+        background: linear-gradient(135deg, #ffd1dc 0%, #ffb6c1 100%);
         padding: clamp(12px, 3vw, 16px) clamp(20px, 5vw, 32px);
-        border-radius: 16px;
+        border-radius: 20px;
         font-size: clamp(14px, 3.5vw, 16px);
         font-weight: 600;
-        color: #2d3748;
-        box-shadow: 0 10px 40px rgba(0,0,0,0.15);
+        color: #ff6b9d;
+        box-shadow: 0 10px 40px rgba(255, 107, 157, 0.2);
         opacity: 0;
         transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
         z-index: 100;
         max-width: calc(100vw - 40px);
+        border: 2px solid #ff9aa2;
       }
       .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
-      #successView { display: none; }
-      .success-card {
+      .waiting-card {
         text-align: center;
-        background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%);
-        border: 2px solid #28a745;
+        background: linear-gradient(135deg, #fff9c4 0%, #ffecb3 100%);
+        border: 2px solid #ffd54f;
+        border-radius: clamp(20px, 5vw, 28px);
       }
-      .success-icon {
-        font-size: clamp(56px, 14vw, 80px);
-        margin-bottom: clamp(12px, 3vw, 20px);
+      .waiting-icon {
+        font-size: clamp(48px, 12vw, 64px);
+        margin-bottom: 12px;
         display: block;
+        animation: pulse 1.5s ease-in-out infinite;
       }
-      .success-card h2 {
-        color: #155724;
+      .waiting-card h3 {
+        color: #ff6b9d;
         margin-bottom: 8px;
-        font-size: clamp(20px, 5vw, 28px);
+        font-size: clamp(18px, 4.5vw, 22px);
+        text-shadow: 1px 1px 2px rgba(255, 107, 157, 0.2);
       }
-      .success-card p {
-        color: #1e7e34;
+      .waiting-card p {
+        color: #ff8fab;
         font-size: clamp(14px, 3.5vw, 16px);
+      }
+      .countdown {
+        font-size: clamp(24px, 6vw, 32px);
+        font-weight: 700;
+        color: #ff6b9d;
+        margin-top: 12px;
+        text-shadow: 1px 1px 2px rgba(255, 107, 157, 0.2);
       }
 
       .owner-card {
-        background: white;
-        border: 2px solid #80D0C7;
+        background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);
+        border: 2px solid #90caf9;
         text-align: center;
+        border-radius: clamp(20px, 5vw, 28px);
       }
       .owner-card.hidden { display: none; }
       .owner-card h3 {
-        color: #0093E9;
+        color: #54a0ff;
         margin-bottom: 8px;
         font-size: clamp(18px, 4.5vw, 22px);
+        text-shadow: 1px 1px 2px rgba(84, 160, 255, 0.2);
       }
       .owner-card p {
-        color: #718096;
+        color: #64b5f6;
         margin-bottom: 16px;
         font-size: clamp(14px, 3.5vw, 16px);
       }
@@ -439,19 +821,30 @@ function renderMainPage(origin) {
         display: flex;
         align-items: center;
         justify-content: center;
+        box-shadow: 0 4px 12px rgba(84, 160, 255, 0.2);
+        transition: all 0.2s;
       }
-      .map-btn.amap { background: #1890ff; color: white; }
-      .map-btn.apple { background: #1d1d1f; color: white; }
+      .map-btn.amap { 
+        background: linear-gradient(135deg, #1890ff 0%, #69c0ff 100%); 
+        color: white;
+      }
+      .map-btn.apple { 
+        background: linear-gradient(135deg, #3a3a3c 0%, #86868b 100%); 
+        color: white;
+      }
+      .map-btn:active { transform: scale(0.96); }
 
       .action-card {
         display: flex;
         flex-direction: column;
         gap: clamp(10px, 2.5vw, 14px);
+        background: #fff5f8;
+        border: 2px solid #ffd1dc;
       }
       .action-hint {
         text-align: center;
         font-size: clamp(13px, 3.5vw, 15px);
-        color: #718096;
+        color: #ff8fab;
         margin-bottom: 4px;
       }
       .btn-retry, .btn-phone {
@@ -469,187 +862,122 @@ function renderMainPage(origin) {
         transition: all 0.2s;
         min-height: 52px;
         text-decoration: none;
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+        user-select: none;
+        box-shadow: 0 6px 20px rgba(255, 107, 157, 0.2);
       }
       .btn-retry {
-        background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
-        box-shadow: 0 8px 24px rgba(245, 158, 11, 0.3);
+        background: linear-gradient(135deg, #feca57 0%, #ff9ff3 100%);
       }
-      .btn-retry:active { transform: scale(0.98); }
+      .btn-retry:active { transform: scale(0.96); transition: transform 0.1s ease; }
       .btn-retry:disabled {
-        background: linear-gradient(135deg, #9ca3af 0%, #6b7280 100%);
+        background: linear-gradient(135deg, #ffecb3 0%, #ffd54f 100%);
         box-shadow: none;
         cursor: not-allowed;
       }
       .btn-phone {
-        background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
-        box-shadow: 0 8px 24px rgba(239, 68, 68, 0.3);
+        background: linear-gradient(135deg, #ff6b9d 0%, #feca57 100%);
       }
-      .btn-phone:active { transform: scale(0.98); }
+      .btn-phone:active { transform: scale(0.96); transition: transform 0.1s ease; }
 
-      @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-      .loading-text { animation: pulse 1.5s ease-in-out infinite; }
-
-      /* 弹窗样式 */
-      .modal-overlay {
-        position: fixed;
-        inset: 0;
-        background: rgba(0, 0, 0, 0.5);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        z-index: 200;
-        padding: 20px;
-        opacity: 0;
-        visibility: hidden;
-        transition: all 0.3s;
-      }
-      .modal-overlay.show {
-        opacity: 1;
-        visibility: visible;
-      }
-      .modal-box {
-        background: white;
-        border-radius: 20px;
-        padding: clamp(24px, 6vw, 32px);
-        max-width: 340px;
-        width: 100%;
+      .closed-card {
         text-align: center;
-        transform: scale(0.9);
-        transition: transform 0.3s;
+        background: linear-gradient(135deg, #e8f5e8 0%, #c8e6c9 100%);
+        border: 2px solid #81c784;
+        border-radius: clamp(20px, 5vw, 28px);
       }
-      .modal-overlay.show .modal-box {
-        transform: scale(1);
+      .closed-icon {
+        font-size: clamp(56px, 14vw, 80px);
+        margin-bottom: 12px;
+        display: block;
+        animation: pulse 2s ease-in-out infinite;
       }
-      .modal-icon {
-        font-size: 48px;
-        margin-bottom: 16px;
-      }
-      .modal-title {
-        font-size: 18px;
-        font-weight: 700;
-        color: #1a202c;
+      .closed-card h2 {
+        color: #4caf50;
         margin-bottom: 8px;
+        font-size: clamp(20px, 5vw, 26px);
+        text-shadow: 1px 1px 2px rgba(76, 175, 80, 0.2);
       }
-      .modal-desc {
-        font-size: 14px;
-        color: #718096;
-        margin-bottom: 24px;
-        line-height: 1.5;
-      }
-      .modal-buttons {
-        display: flex;
-        gap: 12px;
-      }
-      .modal-btn {
-        flex: 1;
-        padding: 14px 16px;
-        border-radius: 12px;
-        font-size: 15px;
-        font-weight: 600;
-        cursor: pointer;
-        border: none;
-        transition: all 0.2s;
-      }
-      .modal-btn:active { transform: scale(0.96); }
-      .modal-btn-primary {
-        background: linear-gradient(135deg, #0093E9 0%, #80D0C7 100%);
-        color: white;
-      }
-      .modal-btn-secondary {
-        background: #f1f5f9;
-        color: #64748b;
+      .closed-card p {
+        color: #66bb6a;
+        font-size: clamp(14px, 3.5vw, 16px);
       }
 
-      /* iPad / 平板适配 */
+      @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.8; } }
+      @keyframes float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-10px); } }
+
       @media (min-width: 768px) {
-        body {
-          align-items: center;
-        }
-        .container {
-          max-width: 480px;
-        }
+        body { align-items: center; }
+        .container { max-width: 480px; }
       }
-
-      /* 大屏幕 iPad Pro / 桌面 */
       @media (min-width: 1024px) {
-        .container {
-          max-width: 520px;
-        }
-        .card {
-          padding: 32px;
-        }
+        .container { max-width: 520px; }
+        .card { padding: 32px; }
       }
-
-      /* 折叠屏展开状态 */
-      @media (min-width: 600px) and (max-width: 900px) {
-        .container {
-          max-width: 460px;
-        }
-      }
-
-      /* 横屏适配 */
-      @media (orientation: landscape) and (max-height: 500px) {
-        body {
-          align-items: flex-start;
-          padding-top: calc(12px + var(--sat));
-        }
-        .header {
-          padding: 16px;
-        }
-        .icon-wrap {
-          width: 60px;
-          height: 60px;
-          margin-bottom: 12px;
-        }
-        .icon-wrap span { font-size: 32px; }
-        .input-card textarea {
-          min-height: 70px;
-        }
-        .success-icon {
-          font-size: 48px;
-          margin-bottom: 10px;
-        }
-      }
-
-      /* 小屏手机适配 */
       @media (max-width: 350px) {
-        .container {
-          gap: 10px;
-        }
-        .card {
-          padding: 14px;
-          border-radius: 18px;
-        }
-        .tags {
-          gap: 6px;
-        }
-        .tag {
-          padding: 8px 10px;
-          font-size: 12px;
-        }
+        .container { gap: 10px; }
+        .card { padding: 14px; border-radius: 18px; }
+        .tags { gap: 6px; }
+        .tag { padding: 8px 10px; font-size: 12px; }
       }
     </style>
   </head>
   <body>
     <div id="toast" class="toast"></div>
-
-    <!-- 页面加载时的位置提示弹窗 -->
-    <div id="locationTipModal" class="modal-overlay">
-      <div class="modal-box">
-        <div class="modal-icon">📍</div>
-        <div class="modal-title">位置信息说明</div>
-        <div class="modal-desc">分享位置可让车主确认您在车旁<br>不分享将延迟30秒发送通知</div>
-        <div class="modal-buttons">
-          <button class="modal-btn modal-btn-primary" onclick="hideModal('locationTipModal');requestLocation()">我知道了</button>
-        </div>
+    <div id="loadingOverlay" class="loading-overlay" style="display: none;">
+      <div class="loading-content">
+        <div class="loading-spinner"></div>
+        <p>处理中...</p>
       </div>
     </div>
 
-    <div class="container" id="mainView">
+    <!-- 车牌验证页面 -->
+    <div class="container" id="verifyView">
+      <div class="card header">
+        <div class="icon-wrap"><span>🚗</span></div>
+        <h1>挪车通知</h1>
+        <p id="greetingText">请稍候，正在处理您的请求</p>
+      </div>
+      <script>
+        // 安抚通知人的话语
+        const greetings = [
+          "车主大大正在赶来的路上～",
+          "别急别急，车主马上就到啦！",
+          "感谢你呀，耐心等待一下下",
+          "车主看到消息会立刻来的",
+          "我们正在努力联系车主哦",
+          "稍等片刻，车主马上就出现",
+          "谢谢你的理解和配合～",
+          "车主正在火速赶来，马上就到",
+          "请稍候，车主很快就会来处理"
+        ];
+        
+        // 随机选择一条显示
+        document.addEventListener('DOMContentLoaded', function() {
+          const greetingElement = document.getElementById('greetingText');
+          if (greetingElement) {
+            const randomGreeting = greetings[Math.floor(Math.random() * greetings.length)];
+            greetingElement.textContent = randomGreeting;
+          }
+        });
+      </script>
+
+      <div class="card plate-verify-card">
+        <h2>🔐 我要验牌</h2>
+        <p>请输入该车二维码绑定的车牌号<br>验证通过后才能通知车主</p>
+        <input type="text" id="plateInput" class="plate-input" placeholder="如: 京A12345" maxlength="10">
+        <button class="verify-btn" onclick="verifyPlate()">验证并继续</button>
+        <div id="verifyError" class="error-msg">车牌号不匹配，请确认后重试</div>
+      </div>
+    </div>
+
+    <!-- 主页面 -->
+    <div class="container" id="mainView" style="display:none">
       <div class="card header">
         <div class="icon-wrap"><span>🚗</span></div>
         <h1>呼叫车主挪车</h1>
-        <p>Notify Car Owner</p>
+        <p>车牌: ${boundPlate}</p>
       </div>
 
       <div class="card input-card">
@@ -672,20 +1000,24 @@ function renderMainPage(origin) {
 
       <button id="notifyBtn" class="card btn-main" onclick="sendNotify()">
         <span>🔔</span>
-        <span>一键通知车主</span>
+        <span>通知车主</span>
       </button>
     </div>
 
-    <div class="container" id="successView">
-      <div class="card success-card">
-        <span class="success-icon">✅</span>
-        <h2>通知已发送！</h2>
-        <p id="waitingText" class="loading-text">正在等待车主回应...</p>
+    <!-- 等待中页面 -->
+    <div class="container" id="waitingView" style="display:none">
+      <div class="card waiting-card">
+        <span class="waiting-icon">⏳</span>
+        <h3>通知已发送</h3>
+        <p>正在等待车主回应...</p>
+        <div class="countdown" id="countdown">60</div>
+        <p style="font-size: 12px; margin-top: 8px;">下次可发送倒计时</p>
       </div>
 
       <div id="ownerFeedback" class="card owner-card hidden">
         <span style="font-size:56px; display:block; margin-bottom:16px">🎉</span>
-        <h3>车主已收到通知</h3>
+        <h3>车主已确认</h3>
+        <div id="ownerReply" class="owner-reply" style="display:none; margin-bottom:16px; padding:12px; background:#fff0f5; border-radius:12px;"></div>
         <p>正在赶来，点击查看车主位置</p>
         <div id="ownerMapLinks" class="map-links" style="display:none">
           <a id="ownerAmapLink" href="#" class="map-btn amap">🗺️ 高德地图</a>
@@ -694,10 +1026,10 @@ function renderMainPage(origin) {
       </div>
 
       <div class="card action-card">
-        <p class="action-hint">车主没反应？试试其他方式</p>
-        <button id="retryBtn" class="btn-retry" onclick="retryNotify()">
+        <p class="action-hint">车主没反应？</p>
+        <button id="retryBtn" class="btn-retry" onclick="retryNotify()" disabled>
           <span>🔔</span>
-          <span>再次通知</span>
+          <span>再次通知 (<span id="retryCountdown">60</span>s)</span>
         </button>
         <a href="tel:${phone}" class="btn-phone">
           <span>📞</span>
@@ -706,158 +1038,356 @@ function renderMainPage(origin) {
       </div>
     </div>
 
+    <!-- 请求已关闭页面 -->
+    <div class="container" id="closedView" style="display:none">
+      <div class="card closed-card">
+        <span class="closed-icon">✅</span>
+        <h2>请求已处理完毕</h2>
+        <p>车主已确认并分享位置<br>该次挪车请求已完成</p>
+      </div>
+      
+      <div id="ownerReplyCard" class="card" style="text-align: left; display: none;">
+        <h3 style="margin-bottom: 12px; color: #ff6b9d;">车主回复</h3>
+        <div id="ownerReplyContent" class="owner-reply" style="padding: 16px; background: #fff0f5; border-radius: 12px; margin-bottom: 16px;"></div>
+      </div>
+      
+      <div id="ownerLocationCard" class="card" style="text-align: center; display: none;">
+        <h3 style="margin-bottom: 12px; color: #ff6b9d;">车主位置</h3>
+        <p style="color: #718096; font-size: 14px; margin-bottom: 16px;">点击查看车主实时位置</p>
+        <div id="ownerMapLinksClosed" class="map-links" style="display: flex; gap: 12px; justify-content: center;">
+          <a id="ownerAmapLinkClosed" href="#" class="map-btn amap" style="padding: 12px 16px; background: #f8f9fa; border-radius: 8px; text-decoration: none; color: #333; font-size: 14px;">🗺️ 高德地图</a>
+          <a id="ownerAppleLinkClosed" href="#" class="map-btn apple" style="padding: 12px 16px; background: #f8f9fa; border-radius: 8px; text-decoration: none; color: #333; font-size: 14px;">🍎 Apple Maps</a>
+        </div>
+      </div>
+      
+      <div class="card" style="text-align: center;">
+        <p style="color: #718096; font-size: 14px;">车主已确认，正在赶来</p>
+      </div>
+    </div>
+
     <script>
-      let userLocation = null;
-      let checkTimer = null;
+      let userLocation = null
+      let checkTimer = null
+      let countdownTimer = null
+      let boundPlate = '${boundPlate}'
+      let plateId = '${plateId}'
+      let isVerified = false
+      let canRetry = false
 
-      // 页面加载时显示提示弹窗
       window.onload = () => {
-        showModal('locationTipModal');
-      };
-
-      function showModal(id) {
-        document.getElementById(id).classList.add('show');
+        requestLocation()
       }
 
-      function hideModal(id) {
-        document.getElementById(id).classList.remove('show');
+      async function verifyPlate() {
+        const input = document.getElementById('plateInput')
+        const error = document.getElementById('verifyError')
+        const plate = input.value.trim()
+        
+        if (!plate) {
+          input.classList.add('error')
+          error.textContent = '请输入车牌号'
+          error.classList.add('show')
+          return
+        }
+        
+        try {
+          const res = await fetch('/api/verify-plate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ plate: plate })
+          })
+          
+          const data = await res.json()
+          
+          if (data.success) {
+            isVerified = true
+            document.getElementById('verifyView').style.display = 'none'
+            document.getElementById('mainView').style.display = 'flex'
+            showToast('✅ 验证通过')
+          } else {
+            input.classList.add('error')
+            error.textContent = data.message || '车牌号不匹配'
+            error.classList.add('show')
+          }
+        } catch (e) {
+          input.classList.add('error')
+          error.textContent = '验证失败，请重试'
+          error.classList.add('show')
+        }
+      }
+      
+      const plateInput = document.getElementById('plateInput')
+      const verifyError = document.getElementById('verifyError')
+      
+      if (plateInput && verifyError) {
+        plateInput.addEventListener('input', function() {
+          this.classList.remove('error')
+          verifyError.classList.remove('show')
+        })
+        
+        plateInput.addEventListener('keypress', function(e) {
+          if (e.key === 'Enter') verifyPlate()
+        })
       }
 
-      // 用户点击"我知道了"后请求位置
       function requestLocation() {
-        const icon = document.getElementById('locIcon');
-        const txt = document.getElementById('locStatus');
+        const icon = document.getElementById('locIcon')
+        const txt = document.getElementById('locStatus')
 
-        icon.className = 'loc-icon loading';
-        txt.className = 'loc-status';
-        txt.innerText = '正在获取定位...';
+        icon.className = 'loc-icon loading'
+        txt.className = 'loc-status'
+        txt.innerText = '正在获取定位...'
 
         if ('geolocation' in navigator) {
           navigator.geolocation.getCurrentPosition(
             (pos) => {
-              userLocation = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-              icon.className = 'loc-icon success';
-              txt.className = 'loc-status success';
-              txt.innerText = '已获取位置 ✓';
+              userLocation = { lat: pos.coords.latitude, lng: pos.coords.longitude }
+              icon.className = 'loc-icon success'
+              txt.className = 'loc-status success'
+              txt.innerText = '已获取位置 ✓'
             },
             (err) => {
-              icon.className = 'loc-icon error';
-              txt.className = 'loc-status error';
-              txt.innerText = '位置获取失败，刷新页面可重试';
+              icon.className = 'loc-icon error'
+              txt.className = 'loc-status error'
+              txt.innerText = '位置获取失败，将延迟发送'
             },
-            { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
-          );
+            { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
+          )
         } else {
-          icon.className = 'loc-icon error';
-          txt.className = 'loc-status error';
-          txt.innerText = '浏览器不支持定位';
+          icon.className = 'loc-icon error'
+          txt.className = 'loc-status error'
+          txt.innerText = '浏览器不支持定位'
         }
       }
 
       function addTag(text) {
-        document.getElementById('msgInput').value = text;
+        document.getElementById('msgInput').value = text
       }
 
-      // 发送通知
-      async function sendNotify() {
-        const btn = document.getElementById('notifyBtn');
-        const msg = document.getElementById('msgInput').value;
-        const delayed = !userLocation; // 无位置则延迟
+      // 缓存DOM元素引用
+      const domElements = {
+        notifyBtn: document.getElementById('notifyBtn'),
+        msgInput: document.getElementById('msgInput'),
+        loadingOverlay: document.getElementById('loadingOverlay'),
+        mainView: document.getElementById('mainView'),
+        waitingView: document.getElementById('waitingView'),
+        closedView: document.getElementById('closedView')
+      }
 
-        btn.disabled = true;
-        btn.innerHTML = '<span>🚀</span><span>发送中...</span>';
+      async function sendNotify() {
+        const btn = domElements.notifyBtn
+        const msg = domElements.msgInput.value
+        const delayed = !userLocation
+        const loadingOverlay = domElements.loadingOverlay
+
+        btn.disabled = true
+        btn.innerHTML = '<span>🚀</span><span>发送中...</span>'
+        loadingOverlay.style.display = 'flex'
 
         try {
           const res = await fetch('/api/notify', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: msg, location: userLocation, delayed: delayed })
-          });
+            body: JSON.stringify({ 
+              message: msg, 
+              location: userLocation, 
+              delayed: delayed,
+              boundPlate: boundPlate
+            })
+          })
 
-          if (res.ok) {
+          const data = await res.json()
+
+          if (res.ok && data.success) {
             if (delayed) {
-              showToast('⏳ 通知将延迟30秒发送');
+              showToast('⏳ 通知将延迟30秒发送')
             } else {
-              showToast('✅ 发送成功！');
+              showToast('✅ 发送成功！')
             }
-            document.getElementById('mainView').style.display = 'none';
-            document.getElementById('successView').style.display = 'flex';
-            startPolling();
+            domElements.mainView.style.display = 'none'
+            domElements.waitingView.style.display = 'flex'
+            startCountdown()
+            startPolling()
+          } else if (data.closed) {
+            showToast('该请求已处理完毕')
+            domElements.mainView.style.display = 'none'
+            domElements.closedView.style.display = 'flex'
           } else {
-            throw new Error('API Error');
+            throw new Error(data.error || '发送失败')
           }
         } catch (e) {
-          showToast('❌ 发送失败，请重试');
-          btn.disabled = false;
-          btn.innerHTML = '<span>🔔</span><span>一键通知车主</span>';
+          showToast('❌ ' + (e.message || '发送失败，请重试'))
+          btn.disabled = false
+          btn.innerHTML = '<span>🔔</span><span>通知车主</span>'
+        } finally {
+          loadingOverlay.style.display = 'none'
         }
+      }
+
+      function startCountdown() {
+        let seconds = 60
+        const countdownEl = document.getElementById('countdown')
+        const retryCountdownEl = document.getElementById('retryCountdown')
+        const retryBtn = document.getElementById('retryBtn')
+        const phoneBtn = document.querySelector('.btn-phone')
+        
+        // 禁用拨打电话按钮
+        if (phoneBtn) {
+          phoneBtn.style.pointerEvents = 'none'
+          phoneBtn.style.opacity = '0.5'
+          phoneBtn.style.cursor = 'not-allowed'
+        }
+        
+        countdownTimer = setInterval(() => {
+          seconds--
+          countdownEl.textContent = seconds
+          retryCountdownEl.textContent = seconds
+          
+          if (seconds <= 0) {
+            clearInterval(countdownTimer)
+            canRetry = true
+            retryBtn.disabled = false
+            retryBtn.innerHTML = '<span>🔔</span><span>再次通知</span>'
+            
+            // 启用拨打电话按钮
+            if (phoneBtn) {
+              phoneBtn.style.pointerEvents = 'auto'
+              phoneBtn.style.opacity = '1'
+              phoneBtn.style.cursor = 'pointer'
+            }
+          }
+        }, 1000)
       }
 
       function startPolling() {
-        let count = 0;
+        let count = 0
+        let interval = 5000 // 初始5秒轮询
+        
         checkTimer = setInterval(async () => {
-          count++;
-          if (count > 120) { clearInterval(checkTimer); return; }
+          count++
+          if (count > 30) { clearInterval(checkTimer); return }
           try {
-            const res = await fetch('/api/check-status');
-            const data = await res.json();
+            const res = await fetch('/api/check-status')
+            const data = await res.json()
+            
             if (data.status === 'confirmed') {
-              const fb = document.getElementById('ownerFeedback');
-              fb.classList.remove('hidden');
+              const fb = document.getElementById('ownerFeedback')
+              fb.classList.remove('hidden')
 
-              if (data.ownerLocation && data.ownerLocation.amapUrl) {
-                document.getElementById('ownerMapLinks').style.display = 'flex';
-                document.getElementById('ownerAmapLink').href = data.ownerLocation.amapUrl;
-                document.getElementById('ownerAppleLink').href = data.ownerLocation.appleUrl;
+              // 显示车主回复
+              if (data.ownerLocation && data.ownerLocation.reply) {
+                const replyEl = document.getElementById('ownerReply')
+                replyEl.textContent = data.ownerLocation.reply
+                replyEl.style.display = 'block'
               }
 
-              clearInterval(checkTimer);
-              if(navigator.vibrate) navigator.vibrate([200, 100, 200]);
+              if (data.ownerLocation && data.ownerLocation.amapUrl) {
+                document.getElementById('ownerMapLinks').style.display = 'flex'
+                document.getElementById('ownerAmapLink').href = data.ownerLocation.amapUrl
+                document.getElementById('ownerAppleLink').href = data.ownerLocation.appleUrl
+              }
+
+              // 隐藏拨打电话按钮
+              const actionCard = document.querySelector('.action-card')
+              if (actionCard) {
+                actionCard.style.display = 'none'
+              }
+
+              // 只有当请求未关闭时才继续轮询
+              if (!data.closed) {
+                clearInterval(checkTimer)
+                clearInterval(countdownTimer)
+                if(navigator.vibrate) navigator.vibrate([200, 100, 200])
+              }
             }
+            
+            if (data.closed) {
+              // 清除定时器
+              clearInterval(checkTimer)
+              clearInterval(countdownTimer)
+              
+              // 显示车主回复（如果有）
+              const ownerReplyCard = document.getElementById('ownerReplyCard')
+              const ownerReplyContent = document.getElementById('ownerReplyContent')
+              if (data.ownerLocation && data.ownerLocation.reply) {
+                ownerReplyContent.textContent = data.ownerLocation.reply
+                ownerReplyCard.style.display = 'block'
+              }
+              
+              // 显示车主位置链接（如果有）
+              const ownerLocationCard = document.getElementById('ownerLocationCard')
+              if (data.ownerLocation && data.ownerLocation.amapUrl) {
+                document.getElementById('ownerAmapLinkClosed').href = data.ownerLocation.amapUrl
+                document.getElementById('ownerAppleLinkClosed').href = data.ownerLocation.appleUrl
+                ownerLocationCard.style.display = 'block'
+              }
+              
+              // 直接跳转到关闭页面，避免多跳转
+              document.getElementById('waitingView').style.display = 'none'
+              document.getElementById('closedView').style.display = 'flex'
+            }
+            
+            // 逐渐增加轮询间隔，减少网络请求
+            if (count > 5) interval = 8000
+            if (count > 10) interval = 12000
+            clearInterval(checkTimer)
+            checkTimer = setInterval(arguments.callee, interval)
           } catch(e) {}
-        }, 3000);
+        }, interval)
       }
 
       function showToast(text) {
-        const t = document.getElementById('toast');
-        t.innerText = text;
-        t.classList.add('show');
-        setTimeout(() => t.classList.remove('show'), 3000);
+        const t = document.getElementById('toast')
+        t.innerText = text
+        t.classList.add('show')
+        setTimeout(() => t.classList.remove('show'), 3000)
       }
 
       async function retryNotify() {
-        const btn = document.getElementById('retryBtn');
-        btn.disabled = true;
-        btn.innerHTML = '<span>🚀</span><span>发送中...</span>';
+        if (!canRetry) return
+        
+        const btn = document.getElementById('retryBtn')
+        btn.disabled = true
+        btn.innerHTML = '<span>🚀</span><span>发送中...</span>'
 
         try {
           const res = await fetch('/api/notify', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: '再次通知：请尽快挪车', location: userLocation })
-          });
+            body: JSON.stringify({ 
+              message: '再次通知：请尽快挪车', 
+              location: userLocation,
+              boundPlate: boundPlate
+            })
+          })
 
-          if (res.ok) {
-            showToast('✅ 再次通知已发送！');
-            document.getElementById('waitingText').innerText = '已再次通知，等待车主回应...';
+          const data = await res.json()
+          
+          if (res.ok && data.success) {
+            showToast('✅ 再次通知已发送！')
+            canRetry = false
+            startCountdown()
+          } else if (data.closed) {
+            showToast('该请求已处理完毕')
+            document.getElementById('waitingView').style.display = 'none'
+            document.getElementById('closedView').style.display = 'flex'
           } else {
-            throw new Error('API Error');
+            throw new Error(data.error || '发送失败')
           }
         } catch (e) {
-          showToast('❌ 发送失败，请重试');
+          showToast('❌ ' + (e.message || '发送失败'))
+          btn.disabled = false
+          btn.innerHTML = '<span>🔔</span><span>再次通知</span>'
         }
-
-        btn.disabled = false;
-        btn.innerHTML = '<span>🔔</span><span>再次通知</span>';
       }
     </script>
   </body>
   </html>
-  `;
-  return new Response(html, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+  `
+  return new Response(html, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } })
 }
 
-function renderOwnerPage() {
+function renderOwnerPage(boundPlate) {
   const html = `
   <!DOCTYPE html>
   <html lang="zh-CN">
@@ -866,14 +1396,27 @@ function renderOwnerPage() {
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="theme-color" content="#667eea">
+    <meta name="theme-color" content="#ff6b9d">
     <title>确认挪车</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin>
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+    <noscript>
+      <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+    </noscript>
     <style>
       :root {
         --sat: env(safe-area-inset-top, 0px);
         --sar: env(safe-area-inset-right, 0px);
         --sab: env(safe-area-inset-bottom, 0px);
         --sal: env(safe-area-inset-left, 0px);
+        --primary: #ff6b9d;
+        --secondary: #feca57;
+        --accent: #54a0ff;
+        --light: #f8f9fa;
+        --dark: #2d3436;
+        --pink: #ff9ff3;
+        --purple: #5f27cd;
       }
       * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
       html {
@@ -881,8 +1424,10 @@ function renderOwnerPage() {
         -webkit-text-size-adjust: 100%;
       }
       body {
-        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
-        background: linear-gradient(160deg, #667eea 0%, #764ba2 100%);
+        font-family: 'Noto Sans SC', -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
+        background: linear-gradient(135deg, #ff6b9d 0%, #feca57 25%, #48dbfb 50%, #1dd1a1 75%, #5f27cd 100%);
+        background-size: 400% 400%;
+        animation: gradientBG 15s ease infinite;
         min-height: 100vh;
         min-height: -webkit-fill-available;
         padding: clamp(16px, 4vw, 24px);
@@ -894,6 +1439,74 @@ function renderOwnerPage() {
         flex-direction: column;
         align-items: center;
         justify-content: center;
+        position: relative;
+      }
+      @keyframes gradientBG {
+        0% { background-position: 0% 50%; }
+        50% { background-position: 100% 50%; }
+        100% { background-position: 0% 50%; }
+      }
+      .loading-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(255, 255, 255, 0.9);
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        z-index: 9999;
+      }
+      .loading-content {
+        text-align: center;
+        padding: 24px;
+        background: rgba(255, 255, 255, 0.95);
+        border-radius: 16px;
+        box-shadow: 0 10px 40px rgba(255, 107, 157, 0.3);
+        border: 2px solid #ffd1dc;
+      }
+      .loading-spinner {
+        width: 48px;
+        height: 48px;
+        margin: 0 auto 16px;
+        border: 4px solid #ffd1dc;
+        border-top: 4px solid #ff6b9d;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+      }
+      @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+      }
+      .loading-content p {
+        color: #ff6b9d;
+        font-weight: 600;
+        margin: 0;
+      }
+      @media (max-height: 600px) {
+        body {
+          justify-content: flex-start;
+          padding-top: calc(clamp(12px, 3vw, 20px) + var(--sat));
+        }
+      }
+      body::before {
+        content: '✨';
+        position: fixed;
+        top: 20%;
+        left: 10%;
+        font-size: 24px;
+        animation: float 6s ease-in-out infinite;
+        z-index: -1;
+      }
+      body::after {
+        content: '🌸';
+        position: fixed;
+        bottom: 20%;
+        right: 10%;
+        font-size: 32px;
+        animation: float 8s ease-in-out infinite reverse;
+        z-index: -1;
       }
       .card {
         background: rgba(255,255,255,0.95);
@@ -902,35 +1515,72 @@ function renderOwnerPage() {
         text-align: center;
         width: 100%;
         max-width: 420px;
-        box-shadow: 0 20px 60px rgba(102, 126, 234, 0.3);
+        box-shadow: 0 20px 60px rgba(255, 107, 157, 0.3);
+        border: 2px solid #ffd1dc;
+        position: relative;
+        overflow: hidden;
+      }
+      .card::before {
+        content: '';
+        position: absolute;
+        top: -50%;
+        right: -50%;
+        width: 200%;
+        height: 200%;
+        background: radial-gradient(circle, rgba(255,107,157,0.1) 0%, rgba(255,107,157,0) 70%);
+        z-index: 0;
       }
       .emoji {
         font-size: clamp(52px, 13vw, 72px);
         margin-bottom: clamp(16px, 4vw, 24px);
         display: block;
+        animation: pulse 2s ease-in-out infinite;
+        position: relative;
+        z-index: 1;
       }
       h1 {
         font-size: clamp(22px, 5.5vw, 28px);
-        color: #2d3748;
+        color: #ff6b9d;
         margin-bottom: 8px;
+        text-shadow: 1px 1px 2px rgba(255, 107, 157, 0.2);
+        position: relative;
+        z-index: 1;
       }
       .subtitle {
-        color: #718096;
+        color: #ff8fab;
         font-size: clamp(14px, 3.5vw, 16px);
         margin-bottom: clamp(20px, 5vw, 28px);
+        position: relative;
+        z-index: 1;
+      }
+      .plate-info {
+        background: linear-gradient(135deg, #ffd1dc 0%, #ffb6c1 100%);
+        border-radius: clamp(12px, 3vw, 16px);
+        padding: clamp(12px, 3vw, 16px);
+        margin-bottom: clamp(16px, 4vw, 24px);
+        font-size: clamp(16px, 4vw, 20px);
+        font-weight: 700;
+        color: #ff6b9d;
+        border: 2px solid #ff9aa2;
+        position: relative;
+        z-index: 1;
+        box-shadow: 0 4px 12px rgba(255, 107, 157, 0.15);
       }
 
       .map-section {
-        background: linear-gradient(135deg, #eef2ff 0%, #e0e7ff 100%);
+        background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);
         border-radius: clamp(14px, 3.5vw, 18px);
         padding: clamp(14px, 3.5vw, 20px);
         margin-bottom: clamp(16px, 4vw, 24px);
         display: none;
+        border: 2px solid #90caf9;
+        position: relative;
+        z-index: 1;
       }
       .map-section.show { display: block; }
       .map-section p {
         font-size: clamp(12px, 3.2vw, 14px);
-        color: #6366f1;
+        color: #54a0ff;
         margin-bottom: 12px;
         font-weight: 600;
       }
@@ -948,31 +1598,102 @@ function renderOwnerPage() {
         font-weight: 600;
         font-size: clamp(13px, 3.5vw, 15px);
         text-align: center;
-        transition: transform 0.2s;
+        transition: transform 0.2s, box-shadow 0.2s;
         min-height: 48px;
         display: flex;
         align-items: center;
         justify-content: center;
+        box-shadow: 0 4px 12px rgba(84, 160, 255, 0.2);
       }
       .map-btn:active { transform: scale(0.96); }
-      .map-btn.amap { background: #1890ff; color: white; }
-      .map-btn.apple { background: #1d1d1f; color: white; }
+      .map-btn.amap { 
+        background: linear-gradient(135deg, #1890ff 0%, #69c0ff 100%); 
+        color: white;
+      }
+      .map-btn.apple { 
+        background: linear-gradient(135deg, #3a3a3c 0%, #86868b 100%); 
+        color: white;
+      }
 
       .loc-status {
-        background: #fef3c7;
+        background: linear-gradient(135deg, #fff9c4 0%, #ffecb3 100%);
         border-radius: clamp(10px, 2.5vw, 14px);
         padding: clamp(10px, 2.5vw, 14px) clamp(14px, 3.5vw, 18px);
         margin-bottom: clamp(16px, 4vw, 24px);
         font-size: clamp(13px, 3.5vw, 15px);
-        color: #92400e;
+        color: #ff6b9d;
         display: none;
+        border: 2px solid #ffd54f;
+        position: relative;
+        z-index: 1;
       }
       .loc-status.show { display: block; }
-      .loc-status.success { background: #d1fae5; color: #065f46; }
-      .loc-status.error { background: #fee2e2; color: #991b1b; }
+      .loc-status.success { 
+        background: linear-gradient(135deg, #e8f5e8 0%, #c8e6c9 100%); 
+        color: #4caf50;
+        border: 2px solid #81c784;
+      }
+      .loc-status.error { 
+        background: linear-gradient(135deg, #ffebee 0%, #ffcdd2 100%); 
+        color: #ff6b9d;
+        border: 2px solid #ff8a80;
+      }
+
+      .reply-section {
+        margin-bottom: clamp(16px, 4vw, 24px);
+        position: relative;
+        z-index: 1;
+      }
+      .reply-section textarea {
+        width: 100%;
+        min-height: 80px;
+        padding: clamp(12px, 3vw, 16px);
+        border: 2px solid #ffb6c1;
+        border-radius: clamp(12px, 3vw, 16px);
+        font-size: clamp(14px, 3.5vw, 16px);
+        font-family: inherit;
+        resize: none;
+        outline: none;
+        background: #fff5f8;
+        color: #ff6b9d;
+      }
+      .reply-section textarea:focus {
+        border-color: #ff6b9d;
+        box-shadow: 0 0 0 3px rgba(255, 107, 157, 0.1);
+      }
+      .reply-section textarea::placeholder {
+        color: #ffb6c1;
+      }
+
+      .quick-replies {
+        display: flex;
+        flex-wrap: wrap;
+        gap: clamp(6px, 2vw, 10px);
+        margin-top: clamp(10px, 2.5vw, 14px);
+      }
+      .quick-reply {
+        background: linear-gradient(135deg, #ffd1dc 0%, #ffb6c1 100%);
+        color: #ff6b9d;
+        padding: clamp(8px, 2vw, 12px) clamp(12px, 3vw, 16px);
+        border-radius: 20px;
+        font-size: clamp(13px, 3.5vw, 14px);
+        font-weight: 600;
+        cursor: pointer;
+        border: 1px solid #ff9aa2;
+        min-height: 40px;
+        display: flex;
+        align-items: center;
+        transition: all 0.2s;
+        box-shadow: 0 4px 12px rgba(255, 107, 157, 0.15);
+      }
+      .quick-reply:active {
+        transform: scale(0.96);
+        background: linear-gradient(135deg, #ffb6c1 0%, #ff9aa2 100%);
+        box-shadow: 0 2px 8px rgba(255, 107, 157, 0.2);
+      }
 
       .btn {
-        background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+        background: linear-gradient(135deg, #ff6b9d 0%, #feca57 100%);
         color: white;
         border: none;
         width: 100%;
@@ -981,44 +1702,58 @@ function renderOwnerPage() {
         font-size: clamp(16px, 4.2vw, 19px);
         font-weight: 700;
         cursor: pointer;
-        box-shadow: 0 8px 24px rgba(16, 185, 129, 0.35);
+        box-shadow: 0 8px 24px rgba(255, 107, 157, 0.35);
         display: flex;
         align-items: center;
         justify-content: center;
         gap: 10px;
         transition: all 0.2s;
         min-height: 56px;
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+        user-select: none;
+        border: 2px solid #ffd1dc;
+        position: relative;
+        z-index: 1;
       }
-      .btn:active { transform: scale(0.98); }
+      .btn:active { transform: scale(0.96); transition: transform 0.1s ease; }
       .btn:disabled {
-        background: linear-gradient(135deg, #9ca3af 0%, #6b7280 100%);
+        background: linear-gradient(135deg, #ffcdd2 0%, #ffb3ba 100%);
         box-shadow: none;
         cursor: not-allowed;
       }
 
       .done-msg {
-        background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%);
+        background: linear-gradient(135deg, #e8f5e8 0%, #c8e6c9 100%);
         border-radius: clamp(14px, 3.5vw, 18px);
         padding: clamp(16px, 4vw, 24px);
         margin-top: clamp(16px, 4vw, 24px);
         display: none;
+        border: 2px solid #81c784;
+        position: relative;
+        z-index: 1;
       }
       .done-msg.show { display: block; }
       .done-msg p {
-        color: #065f46;
+        color: #4caf50;
         font-weight: 600;
         font-size: clamp(15px, 4vw, 17px);
       }
+      .done-msg .sub {
+        color: #66bb6a;
+        font-size: clamp(13px, 3.5vw, 14px);
+        margin-top: 8px;
+        font-weight: 500;
+      }
+      @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.8; } }
+      @keyframes float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-10px); } }
 
-      /* iPad / 平板适配 */
       @media (min-width: 768px) {
         .card {
           max-width: 440px;
           padding: 40px;
         }
       }
-
-      /* 横屏适配 */
       @media (orientation: landscape) and (max-height: 500px) {
         body {
           justify-content: flex-start;
@@ -1035,8 +1770,6 @@ function renderOwnerPage() {
           margin-bottom: 16px;
         }
       }
-
-      /* 小屏手机适配 */
       @media (max-width: 350px) {
         .card {
           padding: 20px;
@@ -1054,12 +1787,24 @@ function renderOwnerPage() {
       <span class="emoji">👋</span>
       <h1>收到挪车请求</h1>
       <p class="subtitle">对方正在等待，请尽快确认</p>
+      
+      <div class="plate-info">🚙 ${boundPlate}</div>
 
       <div id="mapArea" class="map-section">
-        <p>📍 对方位置</p>
+        <p>📍 对方位置（可判断是否真在车旁）</p>
         <div class="map-links">
           <a id="amapLink" href="#" class="map-btn amap">🗺️ 高德地图</a>
           <a id="appleLink" href="#" class="map-btn apple">🍎 Apple Maps</a>
+        </div>
+      </div>
+
+      <div class="reply-section">
+        <textarea id="ownerReply" placeholder="回复对方（可选）" maxlength="100"></textarea>
+        <div class="quick-replies">
+          <div class="quick-reply" onclick="useQuickReply('马上来')">🚀 马上来</div>
+          <div class="quick-reply" onclick="useQuickReply('稍等5分钟')">⏱️ 稍等5分钟</div>
+          <div class="quick-reply" onclick="useQuickReply('正在下楼')">🏃 正在下楼</div>
+          <div class="quick-reply" onclick="useQuickReply('抱歉，马上挪')">🙏 抱歉，马上挪</div>
         </div>
       </div>
 
@@ -1070,76 +1815,80 @@ function renderOwnerPage() {
 
       <div id="doneMsg" class="done-msg">
         <p>✅ 已通知对方您正在赶来！</p>
+        <p class="sub">该请求已关闭，对方无法再次发送通知</p>
       </div>
     </div>
 
     <script>
-      let ownerLocation = null;
+      let ownerLocation = null
+
+      function useQuickReply(text) {
+        document.getElementById('ownerReply').value = text
+      }
 
       window.onload = async () => {
         try {
-          const res = await fetch('/api/get-location');
+          const res = await fetch('/api/get-location')
           if(res.ok) {
-            const data = await res.json();
+            const data = await res.json()
             if(data.amapUrl) {
-              document.getElementById('mapArea').classList.add('show');
-              document.getElementById('amapLink').href = data.amapUrl;
-              document.getElementById('appleLink').href = data.appleUrl;
+              document.getElementById('mapArea').classList.add('show')
+              document.getElementById('amapLink').href = data.amapUrl
+              document.getElementById('appleLink').href = data.appleUrl
             }
           }
         } catch(e) {}
       }
 
-      // 点击确认按钮时，触发浏览器授权
       async function confirmMove() {
-        const btn = document.getElementById('confirmBtn');
-        btn.disabled = true;
-        btn.innerHTML = '<span>📍</span><span>获取位置中...</span>';
+        const btn = document.getElementById('confirmBtn')
+        btn.disabled = true
+        btn.innerHTML = '<span>📍</span><span>获取位置中...</span>'
 
         if ('geolocation' in navigator) {
           navigator.geolocation.getCurrentPosition(
             async (pos) => {
-              // 允许 → 发送确认 + 位置
-              ownerLocation = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-              await doConfirm();
+              ownerLocation = { lat: pos.coords.latitude, lng: pos.coords.longitude }
+              await doConfirm()
             },
             async (err) => {
-              // 拒绝或失败 → 直接发送确认，不带位置
-              ownerLocation = null;
-              await doConfirm();
+              ownerLocation = null
+              await doConfirm()
             },
             { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
-          );
+          )
         } else {
-          // 浏览器不支持定位 → 直接发送确认
-          ownerLocation = null;
-          await doConfirm();
+          ownerLocation = null
+          await doConfirm()
         }
       }
 
-      // 发送确认
       async function doConfirm() {
-        const btn = document.getElementById('confirmBtn');
-        btn.innerHTML = '<span>⏳</span><span>确认中...</span>';
+        const btn = document.getElementById('confirmBtn')
+        const reply = document.getElementById('ownerReply').value.trim()
+        btn.innerHTML = '<span>⏳</span><span>确认中...</span>'
 
         try {
           await fetch('/api/owner-confirm', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ location: ownerLocation })
-          });
+            body: JSON.stringify({ 
+              location: ownerLocation,
+              reply: reply
+            })
+          })
 
-          btn.innerHTML = '<span>✅</span><span>已确认</span>';
-          btn.style.background = 'linear-gradient(135deg, #9ca3af 0%, #6b7280 100%)';
-          document.getElementById('doneMsg').classList.add('show');
+          btn.innerHTML = '<span>✅</span><span>已确认</span>'
+          btn.style.background = 'linear-gradient(135deg, #9ca3af 0%, #6b7280 100%)'
+          document.getElementById('doneMsg').classList.add('show')
         } catch(e) {
-          btn.disabled = false;
-          btn.innerHTML = '<span>🚀</span><span>我已知晓，正在前往</span>';
+          btn.disabled = false
+          btn.innerHTML = '<span>🚀</span><span>我已知晓，正在前往</span>'
         }
       }
     </script>
   </body>
   </html>
-  `;
-  return new Response(html, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+  `
+  return new Response(html, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } })
 }
