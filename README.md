@@ -2,6 +2,10 @@
 
 基于 Cloudflare Workers 的智能挪车通知系统，扫码即可通知车主，保护双方隐私，支持二次元风格界面。
 
+## 原作者
+
+本项目基于 [lesnolie/movecar](https://github.com/lesnolie/movecar) 项目进行优化和扩展。
+
 ## 界面预览
 
 | 请求者页面 | 车主页面 |
